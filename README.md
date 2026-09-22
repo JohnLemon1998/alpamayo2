@@ -259,6 +259,40 @@ Frames are encoded incrementally to keep memory bounded. This is offline replay:
 prediction uses the recorded camera images and ego history at that time. Predictions
 do not control the vehicle or change subsequent inputs.
 
+### Export every Japanese driving scene
+
+Process all scenes from the downloaded dataset in sequence, keeping the model loaded
+across scenes:
+
+```bash
+python -m alpamayo2_super.inference_jodd_batch \
+  --dataset-dir /home/tamag/datasets/jodd-sample \
+  --output-dir outputs/japan_scenes \
+  --step 0.5
+```
+
+Each scene produces `scene-NNNN.mp4`, `scene-NNNN.jsonl`, and a
+`scene-NNNN.complete.json` completion marker. `batch_summary.json` records completed,
+skipped, and failed scenes. The default starts at 2 seconds and calculates each scene's
+valid end from its recorded poses, reserving 6.4 seconds for the future comparison.
+The sample's 20 scenes require 470 predictions with the default 0.5-second step.
+
+Rerun the same command to skip completed scenes with matching data/metadata and settings.
+Incomplete scenes restart from their beginning; `.partial.mp4`/`.partial.jsonl` files
+are never counted as completed videos. A failed scene is recorded and processing
+continues with the next scene. The command exits nonzero if any scene failed; a global
+model-loading failure stops the batch immediately. Do not run two batches into the same
+output directory simultaneously.
+
+Optional arguments:
+
+- `--scenes scene-0668 scene-1341`: process only these scenes.
+- `--start 2 --end 12`: limit the requested interval, clipped to each scene's valid coverage.
+- `--step 0.1`: infer every 0.1 seconds and encode at 10 fps, increasing the workload.
+- `--overwrite`: regenerate completed scenes, for example after changing inference code.
+- `--prepare-only`: check every requested input without loading weights; writes
+  per-scene `.input.json` files and `prepare_summary.json`.
+
 ## Advanced Two-GPU Navigation CFG Demo
 
 `examples/two_gpu_nav_cfg_demo.py` demonstrates navigation classifier-free guidance with the

@@ -79,6 +79,44 @@ def write_video_results(prefix: Path, frames, step: float) -> int:
     return count
 
 
+def render_scene_frames(
+    model, files, scene_name, times, *, model_id, diffusion_steps, seed, first_sample=None,
+):
+    """Render successive predictions with a model that can be reused across scenes."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    from alpamayo2_super.inference_jodd import infer_and_plot
+    from alpamayo2_super.load_jodd import as_torch_sample, prepare_jodd_sample
+
+    for index, t0 in enumerate(times):
+        started = time.perf_counter()
+        data = first_sample if index == 0 and first_sample is not None else as_torch_sample(
+            prepare_jodd_sample(scene_name, t0, files=files)
+        )
+        first_sample = None
+        figure, result = infer_and_plot(
+            model, data, model_id=model_id, diffusion_steps=diffusion_steps, seed=seed,
+        )
+        try:
+            figure.set_dpi(100)
+            figure.suptitle(
+                f"{scene_name} | t = {t0:.2f} s | Recorded-drive replay", fontsize=16,
+            )
+            figure.canvas.draw()
+            image = np.asarray(figure.canvas.buffer_rgba())[..., :3].copy()
+        finally:
+            plt.close(figure)
+        result.update({"t0_s": t0, "replay_mode": "recorded_inputs"})
+        elapsed = time.perf_counter() - started
+        print(
+            f"{scene_name} [{index + 1}/{len(times)}] t={t0:.2f}s, "
+            f"ADE={result['ade_xy_m']:.3f}m, processing={elapsed:.1f}s", flush=True,
+        )
+        del data
+        yield image, result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", default="scene-0668")
@@ -139,46 +177,19 @@ def main() -> None:
         return
 
     import av
-    import matplotlib.pyplot as plt
-    import numpy as np
 
-    from alpamayo2_super.inference_jodd import infer_and_plot
     from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super
 
     av.Codec("libx264", "w")  # Check encoder availability before loading weights.
     model = Alpamayo2Super.from_pretrained(args.model_id, dtype=torch.bfloat16, device_map="cuda:0")
     model.eval()
 
-    def frames():
-        nonlocal first
-        for index, t0 in enumerate(times):
-            started = time.perf_counter()
-            data = first if index == 0 else prepare(t0)
-            first = None
-            figure, result = infer_and_plot(
-                model, data, model_id=args.model_id,
-                diffusion_steps=args.diffusion_steps, seed=args.seed,
-            )
-            try:
-                figure.set_dpi(100)
-                figure.suptitle(
-                    f"{args.scene} | t = {t0:.2f} s | Recorded-drive replay", fontsize=16,
-                )
-                figure.canvas.draw()
-                image = np.asarray(figure.canvas.buffer_rgba())[..., :3].copy()
-            finally:
-                plt.close(figure)
-            result.update({"t0_s": t0, "replay_mode": "recorded_inputs"})
-            elapsed = time.perf_counter() - started
-            print(
-                f"[{index + 1}/{len(times)}] t={t0:.2f}s, "
-                f"ADE={result['ade_xy_m']:.3f}m, processing={elapsed:.1f}s", flush=True,
-            )
-            # Drop large inputs before advancing; only one rendered frame is sent to the encoder.
-            del data
-            yield image, result
-
-    count = write_video_results(prefix, frames(), args.step)
+    frames = render_scene_frames(
+        model, files, args.scene, times, model_id=args.model_id,
+        diffusion_steps=args.diffusion_steps, seed=args.seed, first_sample=first,
+    )
+    del first
+    count = write_video_results(prefix, frames, args.step)
     print(f"Saved video: {prefix}.mp4 ({count} frames, {1 / args.step:g} fps)")
     print(f"Saved predictions and source metadata: {prefix}.jsonl")
 

@@ -150,3 +150,155 @@ def test_video_prepare_only_checks_successive_instants_without_cuda(dataset, tmp
     ]
     assert all(frame["dataset_revision"] == "local" for frame in frames)
     assert all(not frame["future_and_captions_used_as_model_input"] for frame in frames)
+
+
+@pytest.fixture
+def two_scenes(dataset):
+    """A 20-second scene and a separate 9-second scene, sharing only sensor definitions."""
+    from copy import deepcopy
+
+    root = dataset / "v2.X-train"
+    (root / "scene.json").write_text(json.dumps([
+        {"name": "scene-a", "token": "scene"}, {"name": "scene-b", "token": "second"},
+    ]))
+    for name in ("sample", "sample_data", "ego_pose"):
+        path = root / f"{name}.json"
+        original = json.loads(path.read_text())
+        second = []
+        for source in original:
+            if source["timestamp"] > 1_740_000_009_000_000:
+                continue
+            row = deepcopy(source)
+            row["timestamp"] += 60_000_000
+            for key in ("token", "sample_token", "ego_pose_token"):
+                if key in row:
+                    row[key] = f"second-{row[key]}"
+            if name == "sample":
+                row["scene_token"] = "second"
+            if name == "ego_pose":
+                row["translation"][0] += 100
+            second.append(row)
+        path.write_text(json.dumps(original + second))
+    return dataset
+
+
+def test_batch_uses_scene_specific_bounds_and_prepare_only_never_loads_model(
+    two_scenes, tmp_path, monkeypatch,
+):
+    from alpamayo2_super import inference_jodd_batch as batch
+
+    def unexpected_load(*args):
+        pytest.fail("prepare-only must not load model weights")
+
+    monkeypatch.setattr(batch, "_load_model", unexpected_load)
+    result = batch.run_batch(
+        dataset_dir=two_scenes, output_dir=tmp_path / "batch", prepare_only=True,
+    )
+    assert [s["status"] for s in result["scenes"]] == ["inputs_checked", "inputs_checked"]
+    assert [s["frame_count"] for s in result["scenes"]] == [24, 2]
+    assert [s["last_t0_s"] for s in result["scenes"]] == [13.5, 2.5]
+    assert not list((tmp_path / "batch").glob("*.complete.json"))
+
+
+@pytest.fixture
+def batch_predictor(monkeypatch):
+    """Deterministic CPU test predictions; exercise the real batch runner and MP4 encoder."""
+    pytest.importorskip("av")
+    from alpamayo2_super import inference_jodd_batch as batch
+
+    state = {"loads": 0, "models": [], "fail_scene": None}
+
+    def load_model(model_id):
+        state["loads"] += 1
+        return object()
+
+    def frames(model, files, scene_name, times, **kwargs):
+        state["models"].append(model)
+        assert kwargs["first_sample"]["clip_id"] == scene_name
+        for index, t0 in enumerate(times):
+            if state["fail_scene"] == scene_name and index == 1:
+                raise RuntimeError("simulated inference failure")
+            yield np.full((48, 64, 3), 40 + index * 30, np.uint8), {
+                "scene": scene_name, "t0_s": t0, "cot": "CPU test prediction",
+            }
+
+    monkeypatch.setattr(batch, "_load_model", load_model)
+    monkeypatch.setattr(batch, "render_scene_frames", frames)
+    return state
+
+
+def test_batch_reuses_model_and_resumes_only_matching_complete_outputs(
+    two_scenes, tmp_path, batch_predictor,
+):
+    import av
+    from alpamayo2_super import inference_jodd_batch as batch
+
+    output = tmp_path / "batch"
+    options = {"dataset_dir": two_scenes, "output_dir": output, "end": 3}
+    result = batch.run_batch(**options)
+    assert [s["status"] for s in result["scenes"]] == ["complete", "complete"]
+    assert batch_predictor["loads"] == 1
+    assert batch_predictor["models"][0] is batch_predictor["models"][1]
+    for name in ("scene-a", "scene-b"):
+        records = [json.loads(line) for line in (output / f"{name}.jsonl").read_text().splitlines()]
+        assert [r["t0_s"] for r in records] == [2, 2.5]
+        assert all(r["scene"] == name for r in records)
+        with av.open(str(output / f"{name}.mp4")) as video:
+            assert [f.time for f in video.decode(video=0)] == [0, 0.5]
+    skipped = batch.run_batch(**options)
+    assert [s["status"] for s in skipped["scenes"]] == ["skipped_complete"] * 2
+    assert batch_predictor["loads"] == 1
+    changed = batch.run_batch(**options, step=1)
+    assert [s["status"] for s in changed["scenes"]] == ["complete", "complete"]
+    assert [s["frame_count"] for s in changed["scenes"]] == [1, 1]
+    # An interrupted/truncated output must not be treated as complete just because it exists.
+    (output / "scene-a.mp4").write_bytes(b"truncated")
+    repaired = batch.run_batch(**options, step=1)
+    assert [s["status"] for s in repaired["scenes"]] == ["complete", "skipped_complete"]
+
+
+def test_batch_continues_after_scene_failure_and_retries_it_on_resume(
+    two_scenes, tmp_path, batch_predictor,
+):
+    from alpamayo2_super import inference_jodd_batch as batch
+
+    output = tmp_path / "batch"
+    options = {"dataset_dir": two_scenes, "output_dir": output, "end": 3}
+    batch_predictor["fail_scene"] = "scene-a"
+    result = batch.run_batch(**options)
+    assert [s["status"] for s in result["scenes"]] == ["failed", "complete"]
+    assert (output / "scene-a.partial.mp4").is_file()
+    assert not (output / "scene-a.complete.json").exists()
+    assert batch_predictor["loads"] == 1
+    batch_predictor["fail_scene"] = None
+    retried = batch.run_batch(**options)
+    assert [s["status"] for s in retried["scenes"]] == ["complete", "skipped_complete"]
+    assert not (output / "scene-a.partial.mp4").exists()
+    assert len((output / "scene-a.jsonl").read_text().splitlines()) == 2
+    batch_predictor["fail_scene"] = "scene-a"
+    batch.run_batch(**options, overwrite=True)
+    assert not (output / "scene-a.complete.json").exists()
+    batch_predictor["fail_scene"] = None
+    regenerated = batch.run_batch(**options)
+    assert [s["status"] for s in regenerated["scenes"]] == ["complete", "skipped_complete"]
+
+
+def test_batch_does_not_retry_global_model_load_failure_for_every_scene(
+    two_scenes, tmp_path, monkeypatch,
+):
+    from alpamayo2_super import inference_jodd_batch as batch
+
+    calls = []
+
+    def failed_load(model_id):
+        calls.append(model_id)
+        raise RuntimeError("simulated model load failure")
+
+    monkeypatch.setattr(batch, "_load_model", failed_load)
+    output = tmp_path / "batch"
+    with pytest.raises(RuntimeError, match="model load failure"):
+        batch.run_batch(dataset_dir=two_scenes, output_dir=output, end=3)
+    assert len(calls) == 1
+    summary = json.loads((output / "batch_summary.json").read_text())
+    assert len(summary["scenes"]) == 1
+    assert summary["scenes"][0]["status"] == "model_load_failed"
