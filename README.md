@@ -231,6 +231,34 @@ adapter supports rectified images with zero distortion coefficients.
 
 The public sample is distributed under CC BY-NC-SA 4.0; see the dataset's terms.
 
+### Japanese driving video
+
+Run inference at successive times in a recorded scene and export the six camera views,
+predicted/recorded trajectories, and CoC to MP4:
+
+```bash
+python -m alpamayo2_super.inference_jodd_video \
+  --dataset-dir /home/tamag/datasets/jodd-sample \
+  --scene scene-0668 --start 2 --end 12 --step 0.5 \
+  --output-prefix outputs/japan_video
+```
+
+This loads the model once and runs 20 inferences at 2.0, 2.5, ..., 11.5 seconds. The
+end is exclusive. Playback uses 2 fps to preserve the recorded timing, producing a
+10-second video; inference itself can take longer. Use `--step 0.1` for 10 fps with
+five times as many inferences. Keep at least 1.5 seconds of history and 6.4 seconds
+of recorded future available at every requested instant.
+
+- `outputs/japan_video.mp4`: H.264 video, with the scene time displayed in every frame.
+- `outputs/japan_video.jsonl`: one record per video frame with its source time, prediction,
+  CoC, metrics, and input metadata. Completed records are flushed as inference progresses.
+
+Add `--prepare-only` to check all requested inputs without loading model weights; this
+writes `outputs/japan_video.input.json`. Video encoding uses the existing `av` dependency.
+Frames are encoded incrementally to keep memory bounded. This is offline replay: each
+prediction uses the recorded camera images and ego history at that time. Predictions
+do not control the vehicle or change subsequent inputs.
+
 ## Advanced Two-GPU Navigation CFG Demo
 
 `examples/two_gpu_nav_cfg_demo.py` demonstrates navigation classifier-free guidance with the

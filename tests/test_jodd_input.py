@@ -2,6 +2,7 @@
 """Check the coordinate/time boundaries of the Japanese-data inference adapter."""
 
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -128,3 +129,24 @@ def test_incomplete_scene_fails_before_model_load(dataset):
 def test_dataset_files_reject_paths_outside_root(dataset):
     with pytest.raises(ValueError, match="Invalid"):
         DatasetFiles(dataset).path("../outside.json")
+
+
+def test_video_prepare_only_checks_successive_instants_without_cuda(dataset, tmp_path, monkeypatch):
+    import sys
+
+    from alpamayo2_super.inference_jodd_video import main
+
+    prefix = tmp_path / "video-check"
+    monkeypatch.setattr(sys, "argv", [
+        "inference_jodd_video", "--dataset-dir", str(dataset), "--scene", "scene-test",
+        "--start", "2", "--end", "3.5", "--step", "0.5", "--prepare-only",
+        "--output-prefix", str(prefix),
+    ])
+    main()
+    frames = json.loads(Path(f"{prefix}.input.json").read_text())["frames"]
+    assert [frame["t0_s"] for frame in frames] == [2, 2.5, 3]
+    assert [frame["t0_epoch_us"] for frame in frames] == [
+        1_740_000_002_000_000, 1_740_000_002_500_000, 1_740_000_003_000_000,
+    ]
+    assert all(frame["dataset_revision"] == "local" for frame in frames)
+    assert all(not frame["future_and_captions_used_as_model_input"] for frame in frames)

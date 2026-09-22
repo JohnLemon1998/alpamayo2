@@ -11,6 +11,50 @@ from pathlib import Path
 from alpamayo2_super.common.constants import PUBLIC_MODEL_ID
 
 
+def infer_and_plot(model, data, *, model_id: str, diffusion_steps: int, seed: int):
+    """Infer one instant and return a CPU figure/record, releasing temporary GPU inputs."""
+    import numpy as np
+    import torch
+
+    from alpamayo2_super import helper
+    from alpamayo2_super.load_jodd import CAMERA_MAPPING
+    from alpamayo2_super.visualization import plot_inference_result
+
+    # Future poses are held out; helper only passes images and historical ego poses.
+    model_inputs = helper.to_device(
+        helper.prepare_model_inputs(data, model.config, model.tokenizer), "cuda",
+    )
+    torch.cuda.manual_seed_all(seed)
+    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+        pred_xyz, pred_rot, _, extra = model.sample_trajectories_from_data(
+            data=model_inputs, top_p=0.98, temperature=0.6, num_traj_samples=1,
+            diffusion_kwargs={"inference_step": diffusion_steps}, return_extra=True,
+        )
+    pred_xyz = pred_xyz.detach().cpu().float()
+    pred_rot = pred_rot.detach().cpu().float()
+    del model_inputs
+    figure, result = plot_inference_result(
+        data=data, pred_xyz=pred_xyz, extra=extra, model_id=model_id, seed=seed,
+    )
+    source_titles = [CAMERA_MAPPING[i] for i in result["camera_grid_camera_ids"]]
+    for axis, source_name in zip(figure.axes[:6], source_titles):
+        axis.set_title(source_name, fontsize=15)
+    result.update({
+        "figure_style": "jodd_6cam",
+        "camera_titles": source_titles,
+        "jodd": data["jodd_metadata"],
+        "pred_xyz": pred_xyz.numpy().tolist(),
+        "pred_rot": pred_rot.numpy().tolist(),
+        "ego_future_xyz": data["ego_future_xyz"].numpy().tolist(),
+        "ego_history_xyz": data["ego_history_xyz"].numpy().tolist(),
+        "ade_xy_m": float(np.linalg.norm(
+            pred_xyz.numpy()[0, 0, 0, :, :2] - data["ego_future_xyz"].numpy()[0, 0, :, :2],
+            axis=-1,
+        ).mean()),
+    })
+    return figure, result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--scene", default="scene-0668")
@@ -35,10 +79,9 @@ def main() -> None:
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
     os.environ.setdefault("MPLBACKEND", "Agg")
 
-    import numpy as np
     import torch
 
-    from alpamayo2_super.load_jodd import CAMERA_MAPPING, as_torch_sample, prepare_jodd_sample
+    from alpamayo2_super.load_jodd import as_torch_sample, prepare_jodd_sample
 
     if not args.prepare_only and not torch.cuda.is_available():
         parser.error("Inference requires CUDA. Use --prepare-only to check the input on a CPU.")
@@ -60,49 +103,21 @@ def main() -> None:
         print("Input preparation passed. No model inference was performed.")
         return
 
-    from alpamayo2_super import helper
     from alpamayo2_super.models.alpamayo2_super import Alpamayo2Super
-    from alpamayo2_super.visualization import plot_inference_result
 
     model = Alpamayo2Super.from_pretrained(args.model_id, dtype=torch.bfloat16, device_map="cuda:0")
     model.eval()
-    # helper passes images and past ego poses only. Future poses stay on the CPU for evaluation.
-    model_inputs = helper.to_device(
-        helper.prepare_model_inputs(data, model.config, model.tokenizer), "cuda",
-    )
-    torch.cuda.manual_seed_all(args.seed)
-    with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
-        pred_xyz, pred_rot, _, extra = model.sample_trajectories_from_data(
-            data=model_inputs, top_p=0.98, temperature=0.6, num_traj_samples=1,
-            diffusion_kwargs={"inference_step": args.diffusion_steps}, return_extra=True,
-        )
     import matplotlib.pyplot as plt
 
     png_path, json_path = Path(f"{prefix}.png"), Path(f"{prefix}.json")
-    figure, result = plot_inference_result(
-        data=data, pred_xyz=pred_xyz, extra=extra, model_id=args.model_id, seed=args.seed,
+    figure, result = infer_and_plot(
+        model, data, model_id=args.model_id, diffusion_steps=args.diffusion_steps, seed=args.seed,
     )
-    # Label the actual source views instead of claiming NVIDIA camera geometry.
-    source_titles = [CAMERA_MAPPING[i] for i in result["camera_grid_camera_ids"]]
-    for axis, source_name in zip(figure.axes[:6], source_titles):
-        axis.set_title(source_name, fontsize=15)
     figure.savefig(png_path, dpi=180)
     plt.close(figure)
-    result.update({
-        "figure_style": "jodd_6cam",
-        "camera_titles": source_titles,
-        "jodd": metadata,
-        "pred_xyz": pred_xyz.detach().cpu().float().numpy().tolist(),
-        "pred_rot": pred_rot.detach().cpu().float().numpy().tolist(),
-        "ego_future_xyz": data["ego_future_xyz"].numpy().tolist(),
-        "ego_history_xyz": data["ego_history_xyz"].numpy().tolist(),
-    })
     json_path.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8")
-    prediction = pred_xyz.detach().cpu().float().numpy()[0, 0, 0]
-    actual = data["ego_future_xyz"].numpy()[0, 0]
-    ade = np.linalg.norm(prediction[:, :2] - actual[:, :2], axis=-1).mean()
     print("Chain-of-Causation:", result["cot"])
-    print(f"ADE (XY, one sampled trajectory): {ade:.4f} meters")
+    print(f"ADE (XY, one sampled trajectory): {result['ade_xy_m']:.4f} meters")
     print("Saved visualization:", png_path)
     print("Saved predictions:", json_path)
 

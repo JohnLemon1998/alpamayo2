@@ -35,6 +35,7 @@ class DatasetFiles:
 
     def __init__(self, dataset_dir: str | Path | None = None):
         self.root = None if dataset_dir is None else Path(dataset_dir).expanduser().resolve()
+        self._tables: dict[str, list[dict[str, Any]]] = {}
 
     def path(self, filename: str) -> Path:
         relative = Path(filename)
@@ -57,7 +58,11 @@ class DatasetFiles:
         )
 
     def table(self, name: str) -> list[dict[str, Any]]:
-        return json.loads(self.path(f"v2.X-train/{name}.json").read_text(encoding="utf-8"))
+        if name not in self._tables:
+            self._tables[name] = json.loads(
+                self.path(f"v2.X-train/{name}.json").read_text(encoding="utf-8")
+            )
+        return self._tables[name]
 
 
 @dataclass
@@ -129,6 +134,7 @@ def select_past_frames(
 def prepare_jodd_sample(
     scene_name: str = "scene-0668", t0_s: float = 5.1,
     dataset_dir: str | Path | None = None,
+    *, files: DatasetFiles | None = None,
 ) -> dict[str, Any]:
     """Return NumPy inputs and a held-out future for plotting/evaluation only.
 
@@ -137,7 +143,7 @@ def prepare_jodd_sample(
     """
     if not np.isfinite(t0_s) or t0_s < 1.5:
         raise ValueError("--t0 must be finite and leave at least 1.5 s of history")
-    files = DatasetFiles(dataset_dir)
+    files = files if files is not None else DatasetFiles(dataset_dir)
     scenes = files.table("scene")
     scene = next((s for s in scenes if s["name"] == scene_name), None)
     if scene is None:
@@ -228,7 +234,7 @@ def prepare_jodd_sample(
         },
         "jodd_metadata": {
             "dataset_id": DATASET_ID,
-            "dataset_revision": DATASET_REVISION if dataset_dir is None else "local",
+            "dataset_revision": DATASET_REVISION if files.root is None else "local",
             "scene_name": scene_name,
             "scene_token": scene["token"],
             "t0_epoch_us": t0_us,
