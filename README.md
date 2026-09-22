@@ -25,6 +25,7 @@ APIs in this repository run the real expert model.
 - [Setup](#setup)
 - [Model And Data Access](#model-and-data-access)
 - [CLI Inference](#cli-inference)
+- [Japanese Driving Sample](#japanese-driving-sample)
 - [Advanced Two-GPU Navigation CFG Demo](#advanced-two-gpu-navigation-cfg-demo)
 - [Notebook Inference](#notebook-inference)
 - [Text Task Notebooks](#text-task-notebooks)
@@ -190,6 +191,45 @@ python -m alpamayo2_super.inference_smoke \
   --save-viz "$ALPAMAYO2_SUPER_OUTPUT_DIR/public_golden_sample0.png" \
   --save-json "$ALPAMAYO2_SUPER_OUTPUT_DIR/public_golden_sample0.json"
 ```
+
+## Japanese Driving Sample
+
+Run the pretrained model on one scene from
+[Turing's Japan Open Driving Dataset Sample](https://huggingface.co/datasets/turing-motors/Japan-Open-Driving-Dataset-Sample).
+No fine-tuning or CoC annotation is needed. In the existing Linux GPU environment:
+
+```bash
+python -m alpamayo2_super.inference_jodd \
+  --scene scene-0668 --t0 5.1 \
+  --output-prefix outputs/japan_sample0
+```
+
+This fetches six metadata JSON files and only the 24 required JPEGs into the Hugging Face cache,
+using dataset revision `2c08f9d`. It does not download the whole dataset, LiDAR, or captions.
+If you already have the dataset, add `--dataset-dir /path/to/Japan-Open-Driving-Dataset-Sample`.
+Use `--prepare-only` to validate the input without loading model weights. `--scene` selects a scene
+name from `v2.X-train/scene.json`; `--t0` is seconds after that scene's first keyframe. Leave at
+least 1.5 seconds of history and 6.4 seconds of future for the comparison.
+
+Outputs:
+
+- `outputs/japan_sample0.png`: six camera views, predicted/recorded trajectories, and generated CoC.
+- `outputs/japan_sample0.json`: CoC, numerical predicted positions/rotations, comparison metrics,
+  and source-camera provenance.
+- `outputs/japan_sample0.input.json`: exact selected image paths and timestamps.
+
+The adapter interpolates recorded `ego_pose` positions and wxyz rotations, transforms them to
+the ego frame at `t0`, and provides 16 historical poses at 10 Hz. The 64 future poses are used
+only for plotting and comparison, never as model input. Camera frames are selected at or before
+each requested historical timestamp. The existing processor handles image resizing.
+
+Camera views are matched approximately by direction: `CAM_FRONT_LEFT/WIDE/RIGHT` to model IDs
+`0/1/2`, `CAM_BACK_LEFT/RIGHT` to `3/5`, and `CAM_FRONT` to `6`. JODD's lenses and mounting differ
+from NVIDIA's rig; this is an out-of-domain inference experiment, not a validated camera-equivalent
+benchmark. Projection overlays use JODD's own calibration and capture-time poses. The current
+adapter supports rectified images with zero distortion coefficients.
+
+The public sample is distributed under CC BY-NC-SA 4.0; see the dataset's terms.
 
 ## Advanced Two-GPU Navigation CFG Demo
 
